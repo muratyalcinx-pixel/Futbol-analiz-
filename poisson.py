@@ -107,34 +107,106 @@ class PoissonModel:
 
 
 # -------------------------------------------------------------- backtest
-def backtest(df: pd.DataFrame, start_date: str, **model_kwargs) -> dict:
+def _market_probs(r):
+    """Bahis oranlarından marj arındırılmış 1-X-2 olasılıkları (yoksa NaN)."""
+    o = np.array([r.get("odds_1"), r.get("odds_x"), r.get("odds_2")], dtype=float)
+    if np.all(np.isfinite(o)) and np.all(o > 1):
+        raw = 1 / o
+        return raw / raw.sum(), raw.sum() - 1
+    return np.full(3, np.nan), np.nan
+
+
+def _market_over25(r):
+    o = np.array([r.get("odds_over25"), r.get("odds_under25")], dtype=float)
+    if np.all(np.isfinite(o)) and np.all(o > 1):
+        raw = 1 / o
+        return raw[0] / raw.sum()
+    return np.nan
+
+
+def backtest_detailed(df: pd.DataFrame, start_date, **model_kwargs) -> pd.DataFrame:
     """
     Zaman sıralı doğrulama: her maç gününde, o günden ÖNCEKİ verilerle model eğitilir.
-    Brier skoru ve log-loss döndürür (düşük = iyi). Rastgele bölme kullanılmaz.
+    Her maç için model olasılıkları, (varsa) bahis oranlarından çıkan olasılıklar
+    ve gerçek sonuç tek satırda döndürülür.
     """
     df = df.sort_values("date")
-    test_days = df.loc[df["date"] >= pd.Timestamp(start_date), "date"].unique()
+    days = df.loc[df["date"] >= pd.Timestamp(start_date), "date"].unique()
 
-    briers, losses, correct = [], [], []
-    for day in test_days:
+    rows = []
+    for day in days:
         train = df[df["date"] < day]
         if len(train) < 100:
             continue
         model = PoissonModel(**model_kwargs).fit(train)
         for _, r in df[df["date"] == day].iterrows():
             p = model.predict(r["home"], r["away"])
-            probs = np.array([p["p1"], p["px"], p["p2"]])
-            y = np.array([r["result"] == "H", r["result"] == "D", r["result"] == "A"], dtype=float)
-            briers.append(((probs - y) ** 2).sum())
-            losses.append(-np.log(max(probs[y.argmax()], 1e-9)))
-            correct.append(probs.argmax() == y.argmax())
+            m, overround = _market_probs(r)
+            rows.append({
+                "date": r["date"], "home": r["home"], "away": r["away"],
+                "score": f"{int(r['home_goals'])}-{int(r['away_goals'])}",
+                "result": r["result"],
+                "p1": p["p1"], "px": p["px"], "p2": p["p2"],
+                "m1": m[0], "mx": m[1], "m2": m[2], "overround": overround,
+                "p_over25": p["over_2.5"], "m_over25": _market_over25(r),
+                "over25": int(r["home_goals"] + r["away_goals"] > 2.5),
+            })
+    return pd.DataFrame(rows)
 
-    return {
-        "matches": len(briers),
-        "brier": float(np.mean(briers)),
-        "log_loss": float(np.mean(losses)),
-        "accuracy": float(np.mean(correct)),
+
+def summarize(bt: pd.DataFrame) -> dict:
+    """backtest_detailed çıktısından özet metrikler (Brier, log-loss, isabet)."""
+    if bt.empty:
+        return {"matches": 0}
+
+    Y = np.column_stack([bt["result"] == "H", bt["result"] == "D", bt["result"] == "A"]).astype(float)
+    P = bt[["p1", "px", "p2"]].to_numpy()
+    M = bt[["m1", "mx", "m2"]].to_numpy()
+
+    brier = ((P - Y) ** 2).sum(axis=1)
+    logloss = -np.log(np.clip((P * Y).sum(axis=1), 1e-9, None))
+    acc = P.argmax(axis=1) == Y.argmax(axis=1)
+
+    out = {
+        "matches": len(bt),
+        "brier": float(brier.mean()),
+        "log_loss": float(logloss.mean()),
+        "accuracy": float(acc.mean()),
+        "odds_matches": 0,
+        "ou_matches": 0,
     }
+
+    # Bahis oranı karşılaştırması: yalnızca oranı olan maçlar (adil kıyas)
+    mask = ~np.isnan(M).any(axis=1)
+    if mask.any():
+        Pm, Mm, Ym = P[mask], M[mask], Y[mask]
+        out.update({
+            "odds_matches": int(mask.sum()),
+            "model_brier_odds": float(((Pm - Ym) ** 2).sum(axis=1).mean()),
+            "market_brier": float(((Mm - Ym) ** 2).sum(axis=1).mean()),
+            "model_ll_odds": float(-np.log(np.clip((Pm * Ym).sum(axis=1), 1e-9, None)).mean()),
+            "market_ll": float(-np.log(np.clip((Mm * Ym).sum(axis=1), 1e-9, None)).mean()),
+            "model_acc_odds": float((Pm.argmax(axis=1) == Ym.argmax(axis=1)).mean()),
+            "market_acc": float((Mm.argmax(axis=1) == Ym.argmax(axis=1)).mean()),
+            "beats_market_share": float(((Pm * Ym).sum(axis=1) > (Mm * Ym).sum(axis=1)).mean()),
+            "avg_overround": float(bt.loc[mask, "overround"].mean()),
+        })
+
+    # Alt/Üst 2.5 (ikili Brier)
+    mask2 = bt["m_over25"].notna().to_numpy()
+    if mask2.any():
+        y2 = bt.loc[mask2, "over25"].to_numpy(dtype=float)
+        out.update({
+            "ou_matches": int(mask2.sum()),
+            "model_ou_brier": float(((bt.loc[mask2, "p_over25"].to_numpy() - y2) ** 2).mean()),
+            "market_ou_brier": float(((bt.loc[mask2, "m_over25"].to_numpy() - y2) ** 2).mean()),
+        })
+    return out
+
+
+def backtest(df: pd.DataFrame, start_date, **model_kwargs) -> dict:
+    """Kısa yol: özet sözlük döndürür."""
+    return summarize(backtest_detailed(df, start_date, **model_kwargs))
 
 
 if __name__ == "__main__":
@@ -146,4 +218,5 @@ if __name__ == "__main__":
     home, away = model.teams[0], model.teams[1]
     print(model.predict(home, away))
 
-    print(backtest(data, start_date=data["date"].max() - pd.Timedelta(days=180)))
+    bt = backtest_detailed(data, data["date"].max() - pd.Timedelta(days=365))
+    print(summarize(bt))
