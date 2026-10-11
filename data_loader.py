@@ -135,6 +135,45 @@ def load_matches(
     return data.sort_values("date").reset_index(drop=True)
 
 
+FIXTURES_URL = "https://www.football-data.co.uk/fixtures.csv"
+
+FIXTURE_RENAME = {
+    "Div": "league",
+    "Date": "date",
+    "Time": "time",
+    "HomeTeam": "home",
+    "AwayTeam": "away",
+    "B365H": "odds_1",
+    "B365D": "odds_x",
+    "B365A": "odds_2",
+    "B365>2.5": "odds_over25",
+    "B365<2.5": "odds_under25",
+}
+
+
+def load_fixtures(league: str) -> pd.DataFrame:
+    """
+    football-data.co.uk'nin yaklaşan maç listesini (fixtures.csv) indirir ve
+    seçili lige göre filtreler. Dosya canlı değil, periyodik güncellenir.
+    Sütunlar: date, time, home, away (+ varsa oranlar).
+    """
+    resp = requests.get(FIXTURES_URL, timeout=30)
+    resp.raise_for_status()
+    df = pd.read_csv(StringIO(resp.content.decode("latin-1")))
+    df = df.dropna(how="all")
+
+    if "Div" in df.columns:
+        df = df[df["Div"] == league]
+
+    keep = [c for c in FIXTURE_RENAME if c in df.columns]
+    df = df[keep].rename(columns=FIXTURE_RENAME)
+    df["date"] = pd.to_datetime(df["date"], dayfirst=True, errors="coerce")
+    df = df.dropna(subset=["date", "home", "away"])
+
+    sort_cols = ["date"] + (["time"] if "time" in df.columns else [])
+    return df.sort_values(sort_cols).reset_index(drop=True)
+
+
 if __name__ == "__main__":
     df = load_matches(leagues=["T1"], n_seasons=5)
     print(df.shape)

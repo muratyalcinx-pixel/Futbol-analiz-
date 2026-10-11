@@ -12,7 +12,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from data_loader import LEAGUES, load_matches
+from data_loader import LEAGUES, load_fixtures, load_matches
 from poisson import PoissonModel, backtest_detailed, summarize
 
 st.set_page_config(page_title="Futbol Olasılık Analizi", page_icon="⚽", layout="wide")
@@ -27,6 +27,14 @@ def get_data(league: str, n_seasons: int) -> pd.DataFrame:
 @st.cache_resource(show_spinner="Model eğitiliyor...")
 def get_model(league: str, n_seasons: int, half_life: int, shrinkage: float) -> PoissonModel:
     return PoissonModel(half_life_days=half_life, shrinkage=shrinkage).fit(get_data(league, n_seasons))
+
+
+@st.cache_data(show_spinner="Maç listesi yükleniyor...", ttl=3600)
+def get_fixtures(league: str) -> pd.DataFrame:
+    return load_fixtures(league)
+
+
+DISCLAIMER = "Bu uygulama eğitim amaçlıdır; sonuçlar kesinlik taşımaz ve bahis tavsiyesi değildir."
 
 
 @st.cache_data(show_spinner=False, ttl=6 * 3600)
@@ -59,9 +67,112 @@ st.title("⚽ Futbol Olasılık Analizi")
 st.caption(f"{LEAGUES[league]} · Zaman ağırlıklı Poisson modeli")
 
 teams = model.teams
+
+
+def go_to_analysis(h: str, a: str):
+    """Günün Maçları'ndan seçilen maçı Maç Analizi görünümünde aç."""
+    st.session_state["home_sel"] = h
+    st.session_state["away_sel"] = a
+    st.session_state["view"] = "Maç Analizi"
+
+
+view = st.radio("Görünüm", ["Günün Maçları", "Maç Analizi"], horizontal=True,
+                key="view", label_visibility="collapsed")
+
+# ------------------------------------------------------------ günün maçları
+if view == "Günün Maçları":
+    try:
+        fx = get_fixtures(league)
+    except Exception as e:
+        st.error(f"Maç listesi alınamadı: {e}")
+        st.caption(DISCLAIMER)
+        st.stop()
+
+    if fx.empty:
+        st.info("Bu lig için yaklaşan maç bulunamadı. Kaynak dosya periyodik güncellenir; "
+                "birkaç gün sonra tekrar dene ya da 'Maç Analizi' görünümünden takımları elle seç.")
+        st.caption(DISCLAIMER)
+        st.stop()
+
+    today = pd.Timestamp.now(tz="Europe/Istanbul").date()
+    dates = sorted(fx["date"].dt.date.unique())
+    upcoming = [d for d in dates if d >= today]
+    default_idx = dates.index(upcoming[0]) if upcoming else len(dates) - 1
+
+    sel_date = st.selectbox(
+        "Tarih", dates, index=default_idx,
+        format_func=lambda d: d.strftime("%d.%m.%Y") + (" (bugün)" if d == today else ""),
+    )
+    day = fx[fx["date"].dt.date == sel_date]
+
+    rows, skipped = [], []
+    for r in day.to_dict("records"):
+        h, a = r["home"], r["away"]
+        if h not in teams or a not in teams:
+            skipped.append(f"{h} - {a}")
+            continue
+        pr = model.predict(h, a)
+
+        t = r.get("time")
+        o = [r.get("odds_1"), r.get("odds_x"), r.get("odds_2")]
+        if all(pd.notna(x) and x > 1 for x in o):
+            raw = [1 / x for x in o]
+            mk = [v / sum(raw) * 100 for v in raw]
+        else:
+            mk = [None, None, None]
+
+        rows.append({
+            "Saat": str(t) if pd.notna(t) else "",
+            "Ev": h, "Deplasman": a,
+            "1": pr["p1"] * 100, "X": pr["px"] * 100, "2": pr["p2"] * 100,
+            "Üst 2.5": pr["over_2.5"] * 100, "KG Var": pr["btts_yes"] * 100,
+            "Oran 1": mk[0], "Oran X": mk[1], "Oran 2": mk[2],
+        })
+
+    if skipped:
+        st.warning("Modelde bulunamadığı için atlanan maçlar: " + ", ".join(skipped) +
+                   ". Takım yeni çıkmış ya da adı farklı yazılmış olabilir.")
+
+    if not rows:
+        st.info("Bu tarihte gösterilecek maç yok.")
+        st.caption(DISCLAIMER)
+        st.stop()
+
+    table = pd.DataFrame(rows)
+    has_odds = table["Oran 1"].notna().any()
+    show_market = has_odds and st.checkbox("Bahis oranlarından çıkan olasılıkları da göster")
+
+    cols = ["Saat", "Ev", "Deplasman", "1", "X", "2", "Üst 2.5", "KG Var"]
+    pct = st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.0f%%")
+    cfg = {c: pct for c in ["1", "X", "2", "Üst 2.5", "KG Var"]}
+    if show_market:
+        cols += ["Oran 1", "Oran X", "Oran 2"]
+        cfg.update({c: st.column_config.NumberColumn(format="%.0f%%") for c in ["Oran 1", "Oran X", "Oran 2"]})
+
+    st.dataframe(table[cols], hide_index=True, use_container_width=True, column_config=cfg)
+    if show_market:
+        st.caption("Oran sütunları, bahis oranlarından bahisçi marjı arındırılarak hesaplanan olasılıklardır.")
+
+    options = [f"{r['Ev']} - {r['Deplasman']}" for r in rows]
+    pick = st.selectbox("Detaylı incelemek için maç seç", options)
+    chosen = rows[options.index(pick)]
+    st.button("Maç Analizi'ne git", on_click=go_to_analysis, args=(chosen["Ev"], chosen["Deplasman"]))
+
+    st.caption("Maç listesi football-data.co.uk'den alınır; canlı değildir, periyodik güncellenir. "
+               "Saatler kaynaktaki saattir, fikstür değişebilir.")
+    st.divider()
+    st.caption(DISCLAIMER)
+    st.stop()
+
+# -------------------------------------------------------------- maç analizi
+# Lig değişince eski seçimler geçersiz kalabilir
+for k in ("home_sel", "away_sel"):
+    if k in st.session_state and st.session_state[k] not in teams:
+        del st.session_state[k]
+
 c1, c2 = st.columns(2)
-home = c1.selectbox("Ev sahibi", teams, index=0)
-away = c2.selectbox("Deplasman", teams, index=min(1, len(teams) - 1))
+home = c1.selectbox("Ev sahibi", teams, index=0, key="home_sel")
+away = c2.selectbox("Deplasman", teams, index=min(1, len(teams) - 1), key="away_sel")
 
 if home == away:
     st.warning("Lütfen farklı iki takım seçin.")
@@ -205,4 +316,4 @@ with tab4:
                                    file_name="backtest.csv", mime="text/csv")
 
 st.divider()
-st.caption("Bu uygulama eğitim amaçlıdır; sonuçlar kesinlik taşımaz ve bahis tavsiyesi değildir.")
+st.caption(DISCLAIMER)
